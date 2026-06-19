@@ -13,12 +13,14 @@ import webbrowser
 import urllib.request
 import imaplib
 import sqlite3
+import unicodedata
 from pathlib import Path
 from datetime import datetime, date
 from collections import defaultdict
 from threading import Thread, Event
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from dotenv import load_dotenv, set_key
 import ttkbootstrap as ttk
 from tkinter import messagebox, filedialog, simpledialog
@@ -90,9 +92,12 @@ def _init_defaults():
             ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
             ENV_PATH.write_text(
                 'SMTP_HOST=smtp.gmail.com\nSMTP_PORT=587\nSMTP_USE_SSL=false\n'
-                'SMTP_USERNAME=\nSMTP_PASSWORD=\nFROM_NAME=\nSUBJECT=\n'
+                'SMTP_USERNAME=\nSMTP_PASSWORD=\nFROM_NAME=\nFROM_EMAIL=\nSUBJECT=\n'
                 'TEMPLATE_PATH=\nREPLY_TO=\nRATE_PER_MIN=12\n'
-                'IMAP_HOST=imap.gmail.com\nIMAP_PORT=993\nIMAP_USE_SSL=true\n',
+                'IMAP_HOST=imap.gmail.com\nIMAP_PORT=993\nIMAP_USE_SSL=true\n'
+                'IMAP_USERNAME=\nIMAP_PASSWORD=\n'
+                'BOUNCE_METHOD=imap\nBOUNCE_API_KEY=\nBOUNCE_API_URL=\n'
+                'PROVIDER=\n',
                 encoding="utf-8"
             )
 
@@ -105,7 +110,9 @@ def load_env():
         "SMTP_USE_SSL": os.getenv("SMTP_USE_SSL", "false"),
         "SMTP_USERNAME": os.getenv("SMTP_USERNAME", ""),
         "SMTP_PASSWORD": os.getenv("SMTP_PASSWORD", ""),
+        "IAM_USERNAME": os.getenv("IAM_USERNAME", ""),
         "FROM_NAME": os.getenv("FROM_NAME", ""),
+        "FROM_EMAIL": os.getenv("FROM_EMAIL", ""),
         "SUBJECT": os.getenv("SUBJECT", ""),
         "TEMPLATE_PATH": os.getenv("TEMPLATE_PATH", ""),
         "REPLY_TO": os.getenv("REPLY_TO", ""),
@@ -113,6 +120,12 @@ def load_env():
         "IMAP_HOST": os.getenv("IMAP_HOST", "imap.gmail.com"),
         "IMAP_PORT": os.getenv("IMAP_PORT", "993"),
         "IMAP_USE_SSL": os.getenv("IMAP_USE_SSL", "true"),
+        "IMAP_USERNAME": os.getenv("IMAP_USERNAME", ""),
+        "IMAP_PASSWORD": os.getenv("IMAP_PASSWORD", ""),
+        "BOUNCE_METHOD": os.getenv("BOUNCE_METHOD", "imap"),
+        "BOUNCE_API_KEY": os.getenv("BOUNCE_API_KEY", ""),
+        "BOUNCE_API_URL": os.getenv("BOUNCE_API_URL", ""),
+        "PROVIDER": os.getenv("PROVIDER", ""),
     }
     try:
         db_cfg = load_config()
@@ -146,6 +159,12 @@ def save_config(config_dict):
         conn.close()
     except Exception as e:
         print(f"Erro salvando config: {e}")
+
+
+def _ascii_name(s):
+    nfkd = unicodedata.normalize("NFKD", s)
+    plain = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return plain.encode("ascii", errors="replace").decode("ascii")
 
 
 # ── SQLite database ──
@@ -596,8 +615,8 @@ class CampaignTab(ttk.Frame):
     def _check_bounces_imap(self, env):
         if not self.auto_bounce_var.get():
             return set()
-        user = env.get("SMTP_USERNAME", "")
-        pwd = env.get("SMTP_PASSWORD", "")
+        user = env.get("IMAP_USERNAME") or env.get("SMTP_USERNAME", "")
+        pwd = env.get("IMAP_PASSWORD") or env.get("SMTP_PASSWORD", "")
         imap_host = env.get("IMAP_HOST", "imap.gmail.com")
         imap_port = int(env.get("IMAP_PORT", "993"))
         imap_ssl = env.get("IMAP_USE_SSL", "true").lower() == "true"
@@ -606,6 +625,7 @@ class CampaignTab(ttk.Frame):
         try:
             if imap_ssl:
                 mail = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=15)
+
             else:
                 mail = imaplib.IMAP4(imap_host, imap_port, timeout=15)
                 mail.starttls(ssl_context=_ssl_ctx())
@@ -757,12 +777,13 @@ class CampaignTab(ttk.Frame):
                     html = html.replace("{{" + k + "}}", str(v) if v else "")
                 msg = MIMEMultipart("alternative")
                 msg["Subject"] = subject
-                msg["From"] = f"{from_name} <{env['SMTP_USERNAME']}>"
+                from_email = env.get("FROM_EMAIL") or env["SMTP_USERNAME"]
+                msg["From"] = f"{_ascii_name(from_name)} <{from_email}>"
                 msg["To"] = email
                 if reply_to:
                     msg["Reply-To"] = reply_to
                 msg.attach(MIMEText(html, "html", "utf-8"))
-                self._server.sendmail(env["SMTP_USERNAME"], email, msg.as_string())
+                self._server.sendmail(from_email, email, msg.as_string())
                 enviados += 1
                 self._envios_log.append({
                     "email": email, "status": "sucesso", "erro": None,
@@ -922,12 +943,13 @@ class CampaignTab(ttk.Frame):
             server = _connect_smtp(env, timeout=15)
             msg = MIMEMultipart("alternative")
             msg["Subject"] = f"[TESTE] {subject}"
-            msg["From"] = f"{from_name} <{env['SMTP_USERNAME']}>"
+            from_email = env.get("FROM_EMAIL") or env["SMTP_USERNAME"]
+            msg["From"] = f"{_ascii_name(from_name)} <{from_email}>"
             msg["To"] = email
             if reply_to:
                 msg["Reply-To"] = reply_to
             msg.attach(MIMEText(html, "html", "utf-8"))
-            server.sendmail(env["SMTP_USERNAME"], email, msg.as_string())
+            server.sendmail(from_email, email, msg.as_string())
             server.quit()
             self.after(0, self._log, f"✅ Teste enviado para {email}\n")
         except Exception as e:
@@ -970,8 +992,15 @@ class ListsTab(ttk.Frame):
         ttk.Label(mid, text="🔍 Buscar:", bootstyle="primary").pack(side="left")
         ttk.Entry(mid, textvariable=self.search_var, width=30).pack(side="left", padx=5)
         ttk.Button(mid, text="Filtrar", command=self._filter, bootstyle="info").pack(side="left")
-        ttk.Button(mid, text="➕ Adicionar linha", command=self._add_row, bootstyle="success").pack(side="right", padx=3)
-        ttk.Button(mid, text="💾 Salvar", command=self._save, bootstyle="success").pack(side="right", padx=3)
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=2)
+        ttk.Button(actions, text="📄 Nova lista", command=self._new_list, bootstyle="primary").pack(side="left", padx=2)
+        ttk.Button(actions, text="➕ Adicionar contato", command=self._add_contact, bootstyle="success").pack(side="left", padx=2)
+        ttk.Button(actions, text="✏️ Editar contato", command=self._edit_contact, bootstyle="warning").pack(side="left", padx=2)
+        ttk.Button(actions, text="🗑️ Remover contato", command=self._delete_selected, bootstyle="danger").pack(side="left", padx=2)
+        ttk.Button(actions, text="💾 Salvar", command=self._save, bootstyle="success").pack(side="right", padx=2)
+        ttk.Button(actions, text="🗑️ Deletar lista", command=self._delete_list, bootstyle="danger").pack(side="right", padx=2)
 
         cols = ("#", "Email", "Empresa", "Cidade", "Telefone")
         tree_frame = ttk.LabelFrame(self, text="Dados", )
@@ -1085,17 +1114,91 @@ class ListsTab(ttk.Frame):
                     self._data.pop(i)
             self._render()
 
-    def _add_row(self):
-        if not self._data:
+    def _contact_dialog(self, title, defaults=None):
+        if not self._data and not defaults:
             cols = ["Email", "Razao Social", "Cidade", "Telefone"]
+        elif defaults:
+            cols = list(defaults.keys())
         else:
             cols = list(self._data[0].keys())
-        new_row = {c: "" for c in cols}
-        email = simpledialog.askstring("Adicionar", "Email:", parent=self)
-        if email:
-            new_row[cols[0]] = email
-            self._data.append(new_row)
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.geometry("400x300+200+100")
+        dialog.transient(self)
+        dialog.grab_set()
+        entries = {}
+        for i, col in enumerate(cols):
+            ttk.Label(dialog, text=f"{col}:").grid(row=i, column=0, sticky="w", padx=8, pady=4)
+            e = ttk.Entry(dialog, width=40)
+            e.grid(row=i, column=1, sticky="ew", padx=8, pady=4)
+            if defaults and col in defaults:
+                e.insert(0, defaults[col])
+            entries[col] = e
+        result = {"ok": False, "row": None}
+        def confirm():
+            result["row"] = {c: entries[c].get() for c in cols}
+            result["ok"] = True
+            dialog.destroy()
+        def cancel():
+            dialog.destroy()
+        btn_f = ttk.Frame(dialog)
+        btn_f.grid(row=len(cols), column=0, columnspan=2, pady=12)
+        ttk.Button(btn_f, text="Confirmar", command=confirm, bootstyle="success").pack(side="left", padx=6)
+        ttk.Button(btn_f, text="Cancelar", command=cancel, bootstyle="secondary").pack(side="left", padx=6)
+        dialog.wait_window()
+        return result["row"] if result["ok"] else None
+
+    def _add_contact(self):
+        row = self._contact_dialog("Adicionar contato")
+        if row:
+            self._data.append(row)
             self._render()
+
+    def _edit_contact(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Editar", "Selecione um contato.")
+            return
+        idx = int(self.tree.item(sel[0], "values")[0]) - 1
+        if idx < 0 or idx >= len(self._data):
+            return
+        row = self._contact_dialog("Editar contato", defaults=self._data[idx])
+        if row:
+            self._data[idx] = row
+            self._render()
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Remover", "Selecione um ou mais contatos.")
+            return
+        self.tree.event_generate("<Delete>")
+
+    def _new_list(self):
+        name = simpledialog.askstring("Nova lista", "Nome do arquivo (sem .csv):", parent=self)
+        if name:
+            if not name.endswith(".csv"):
+                name += ".csv"
+            path = LISTAS_DIR / name
+            if path.exists():
+                messagebox.showwarning("Nova lista", "Já existe.")
+                return
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("Email;Razao Social;Cidade;Telefone\n")
+            self._refresh_list()
+            self.csv_combo.set(name)
+            self._load_csv(name)
+
+    def _delete_list(self):
+        if not self._current_csv:
+            return
+        if messagebox.askyesno("Deletar lista", f"Excluir '{self._current_csv}' permanentemente?"):
+            path = LISTAS_DIR / self._current_csv
+            if path.exists():
+                path.unlink()
+            self._current_csv = None
+            self._data = []
+            self._refresh_list()
 
     def _save(self):
         if not self._current_csv or not self._data:
@@ -1109,81 +1212,228 @@ class ListsTab(ttk.Frame):
         messagebox.showinfo("Salvo", f"{path.name} salvo com {len(self._data)} linhas.")
 
 
+# ── Provider presets ──
+PROVIDER_PRESETS = {
+    "gmail": {
+        "label": "Gmail",
+        "emoji": "🔴",
+        "smtp": {"SMTP_HOST": "smtp.gmail.com", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": {"IMAP_HOST": "imap.gmail.com", "IMAP_PORT": "993", "IMAP_USE_SSL": "true"},
+        "bounce_method": "imap",
+        "bounce_note": "Bounce via IMAP. Use a mesma conta ou uma dedicada.",
+        "creds_note": "Use App Password (16 chars). Ative 2FA em myaccount.google.com/security",
+        "labels": {"SMTP_USERNAME": "Email Gmail:", "SMTP_PASSWORD": "App Password:"},
+    },
+    "amazon_ses": {
+        "label": "Amazon SES",
+        "emoji": "☁️",
+        "smtp": {"SMTP_HOST": "email-smtp.us-east-1.amazonaws.com", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": None,
+        "bounce_method": "api",
+        "bounce_note": "Bounce via SES API (SNS). Crie um tópico SNS e assine por email ou HTTP.",
+        "creds_note": "Credenciais geradas em SES Console → SMTP Settings. SMTP Username começa com AKIA.",
+        "labels": {"SMTP_USERNAME": "SMTP Username:", "SMTP_PASSWORD": "SMTP Password:"},
+        "host_options": [
+            "email-smtp.us-east-1.amazonaws.com",
+            "email-smtp.us-east-2.amazonaws.com",
+            "email-smtp.us-west-2.amazonaws.com",
+            "email-smtp.eu-west-1.amazonaws.com",
+            "email-smtp.eu-central-1.amazonaws.com",
+            "email-smtp.ap-southeast-1.amazonaws.com",
+            "email-smtp.ap-southeast-2.amazonaws.com",
+            "email-smtp.ap-northeast-1.amazonaws.com",
+            "email-smtp.sa-east-1.amazonaws.com",
+        ],
+    },
+    "sendgrid": {
+        "label": "SendGrid",
+        "emoji": "📧",
+        "smtp": {"SMTP_HOST": "smtp.sendgrid.net", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": None,
+        "bounce_method": "api",
+        "bounce_note": "Bounce via SendGrid API. Use API Key do SendGrid.",
+        "creds_note": "Usuário fixo: 'apikey'. Cole sua API Key no campo Senha.",
+        "labels": {"SMTP_USERNAME": "Usuário (fixo):", "SMTP_PASSWORD": "API Key:"},
+        "username_fixed": "apikey",
+    },
+    "mailgun": {
+        "label": "Mailgun",
+        "emoji": "🔫",
+        "smtp": {"SMTP_HOST": "smtp.mailgun.org", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": None,
+        "bounce_method": "api",
+        "bounce_note": "Bounce via Mailgun API. Use API Key do Mailgun.",
+        "creds_note": "SMTP credentials em Mailgun Dashboard → Domains → SMTP credentials",
+        "labels": {"SMTP_USERNAME": "SMTP Login:", "SMTP_PASSWORD": "SMTP Password:"},
+    },
+    "outlook": {
+        "label": "Outlook",
+        "emoji": "🔵",
+        "smtp": {"SMTP_HOST": "smtp.office365.com", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": {"IMAP_HOST": "outlook.office365.com", "IMAP_PORT": "993", "IMAP_USE_SSL": "true"},
+        "bounce_method": "imap",
+        "bounce_note": "Bounce via IMAP. Use a mesma conta ou uma dedicada.",
+        "creds_note": "Use email e senha da conta Microsoft (ou App Password com 2FA)",
+        "labels": {"SMTP_USERNAME": "Email:", "SMTP_PASSWORD": "Senha / App Password:"},
+    },
+    "generic": {
+        "label": "SMTP Genérico",
+        "emoji": "⚙️",
+        "smtp": {"SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_USE_SSL": "false"},
+        "imap": {"IMAP_HOST": "", "IMAP_PORT": "993", "IMAP_USE_SSL": "true"},
+        "bounce_method": "imap",
+        "bounce_note": "Configure manualmente conforme seu provedor.",
+        "creds_note": "Preencha manualmente os campos abaixo conforme seu provedor",
+        "labels": {"SMTP_USERNAME": "Usuário:", "SMTP_PASSWORD": "Senha:"},
+    },
+}
+
 # ── SMTP Config Tab ──
 class SMTPTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.fields = {}
+        self._field_labels = {}
+        self._provider_btns = {}
+        self._current_provider = None
+        self._creds_label = None
+        self._imap_frame = None
+        self._imap_note = None
         self._build()
 
     def _build(self):
         ttk.Label(self, text="Configuração SMTP",
                   font=("Segoe UI", 14, "bold"), bootstyle="primary").pack(anchor="w")
 
-        main = ttk.Frame(self)
-        main.pack(fill="both", expand=True)
+        # ── Provider selector ──
+        prov_frame = ttk.LabelFrame(self, text="Provedor")
+        prov_frame.pack(fill="x", pady=(4, 0))
 
-        # Left column
-        left = ttk.LabelFrame(main, text="Servidor", )
+        btn_row = ttk.Frame(prov_frame)
+        btn_row.pack()
+
+        provider_keys = list(PROVIDER_PRESETS.keys())
+        colors = ["danger", "info", "warning", "secondary", "primary", "dark"]
+        for idx, pkey in enumerate(provider_keys):
+            p = PROVIDER_PRESETS[pkey]
+            boot = colors[idx % len(colors)]
+            btn = ttk.Button(btn_row, text=f"○  {p['emoji']}  {p['label']}",
+                             bootstyle=f"{boot}-outline",
+                             command=lambda k=pkey: self._select_provider(k))
+            btn.pack(side="left", padx=3, pady=2)
+            self._provider_btns[pkey] = (btn, boot)
+
+        self._creds_label = ttk.Label(prov_frame, text="", bootstyle="secondary",
+                                       font=("Segoe UI", 9, "italic"))
+        self._creds_label.pack(anchor="w", pady=(4, 0))
+
+        # ── SMTP + Sender fields ──
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, pady=4)
+
+        left = ttk.LabelFrame(main, text="Servidor SMTP")
         left.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        right = ttk.LabelFrame(main, text="Remetente", )
+        right = ttk.LabelFrame(main, text="Remetente")
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
         main.grid_columnconfigure(0, weight=1)
         main.grid_columnconfigure(1, weight=1)
 
-        labels_left = [
+        smtp_fields = [
             ("SMTP_HOST", "Servidor:"),
             ("SMTP_PORT", "Porta:"),
             ("SMTP_USE_SSL", "Usar SSL:"),
             ("SMTP_USERNAME", "Usuário:"),
             ("SMTP_PASSWORD", "Senha:"),
+            ("IAM_USERNAME", "Usuário IAM:"),
         ]
-        for i, (key, lbl) in enumerate(labels_left):
-            ttk.Label(left, text=lbl, ).grid(row=i, column=0, sticky="w", pady=3)
+        for i, (key, lbl) in enumerate(smtp_fields):
+            lbl_w = ttk.Label(left, text=lbl)
+            lbl_w.grid(row=i, column=0, sticky="w", pady=3)
+            self._field_labels[key] = lbl_w
             if key == "SMTP_USE_SSL":
                 self.fields[key] = ttk.Combobox(left, values=["true", "false"], state="readonly", width=10)
             elif key == "SMTP_PORT":
                 self.fields[key] = ttk.Combobox(left, values=["465", "587", "25"], state="readonly", width=10)
             elif key == "SMTP_PASSWORD":
                 self.fields[key] = ttk.Entry(left, width=28, show="*")
+            elif key == "SMTP_HOST":
+                self.fields[key] = ttk.Combobox(left, values=[], state="normal", width=36)
             else:
                 self.fields[key] = ttk.Entry(left, width=28)
             self.fields[key].grid(row=i, column=1, sticky="ew", pady=3, padx=5)
 
-        # ── IMAP section ──
-        imap_frame = ttk.LabelFrame(main, text="IMAP (Bounce)", )
-        imap_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-
-        imap_fields = [
-            ("IMAP_HOST", "Servidor IMAP:"),
-            ("IMAP_PORT", "Porta IMAP:"),
-            ("IMAP_USE_SSL", "Usar SSL:"),
-        ]
-        for i, (key, lbl) in enumerate(imap_fields):
-            ttk.Label(imap_frame, text=lbl, ).grid(row=i, column=0, sticky="w", pady=3)
-            if key == "IMAP_USE_SSL":
-                self.fields[key] = ttk.Combobox(imap_frame, values=["true", "false"], state="readonly", width=10)
-            elif key == "IMAP_PORT":
-                self.fields[key] = ttk.Combobox(imap_frame, values=["993", "143"], state="readonly", width=10)
-            else:
-                self.fields[key] = ttk.Entry(imap_frame, width=28)
-            self.fields[key].grid(row=i, column=1, sticky="ew", pady=3, padx=5)
-
-        labels_right = [
+        sender_fields = [
             ("FROM_NAME", "Nome do remetente:"),
+            ("FROM_EMAIL", "Email do remetente:"),
             ("SUBJECT", "Assunto padrão:"),
             ("REPLY_TO", "Reply-To:"),
             ("TEMPLATE_PATH", "Template HTML:"),
             ("RATE_PER_MIN", "Rate (/min):"),
         ]
-        for i, (key, lbl) in enumerate(labels_right):
-            ttk.Label(right, text=lbl, ).grid(row=i, column=0, sticky="w", pady=3)
+        for i, (key, lbl) in enumerate(sender_fields):
+            ttk.Label(right, text=lbl).grid(row=i, column=0, sticky="w", pady=3)
             self.fields[key] = ttk.Entry(right, width=30)
             self.fields[key].grid(row=i, column=1, sticky="ew", pady=3, padx=5)
 
-        # Buttons
+        # ── Bounce section ──
+        self._imap_frame = ttk.LabelFrame(main, text="Monitoramento de Bounce")
+        self._imap_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+
+        ttk.Label(self._imap_frame, text="Método:").grid(row=0, column=0, sticky="w", pady=3)
+        self.fields["BOUNCE_METHOD"] = ttk.Combobox(self._imap_frame,
+            values=["imap", "api", "desativado"], state="readonly", width=14)
+        self.fields["BOUNCE_METHOD"].grid(row=0, column=1, sticky="w", pady=3, padx=5)
+        self.fields["BOUNCE_METHOD"].bind("<<ComboboxSelected>>", self._on_bounce_method_change)
+
+        self._imap_fields_frame = ttk.Frame(self._imap_frame)
+        self._imap_fields_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=2)
+
+        imap_fields = [
+            ("IMAP_HOST", "Servidor IMAP:"),
+            ("IMAP_PORT", "Porta IMAP:"),
+            ("IMAP_USE_SSL", "Usar SSL:"),
+            ("IMAP_USERNAME", "Usuário IMAP:"),
+            ("IMAP_PASSWORD", "Senha IMAP:"),
+        ]
+        for i, (key, lbl) in enumerate(imap_fields):
+            ttk.Label(self._imap_fields_frame, text=lbl).grid(row=i, column=0, sticky="w", pady=2)
+            if key == "IMAP_USE_SSL":
+                self.fields[key] = ttk.Combobox(self._imap_fields_frame, values=["true", "false"], state="readonly", width=10)
+            elif key == "IMAP_PORT":
+                self.fields[key] = ttk.Combobox(self._imap_fields_frame, values=["993", "143"], state="readonly", width=10)
+            elif key == "IMAP_PASSWORD":
+                self.fields[key] = ttk.Entry(self._imap_fields_frame, width=50, show="*")
+            else:
+                self.fields[key] = ttk.Entry(self._imap_fields_frame, width=50)
+            self.fields[key].grid(row=i, column=1, sticky="ew", pady=2, padx=5)
+        self._imap_fields_frame.grid_columnconfigure(1, weight=1)
+
+        self._api_fields_frame = ttk.Frame(self._imap_frame)
+        self._api_fields_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=2)
+
+        ttk.Label(self._api_fields_frame, text="API Key:").grid(row=0, column=0, sticky="w", pady=2)
+        self.fields["BOUNCE_API_KEY"] = ttk.Entry(self._api_fields_frame, width=60, show="*")
+        self.fields["BOUNCE_API_KEY"].grid(row=0, column=1, sticky="ew", pady=2, padx=5)
+
+        ttk.Label(self._api_fields_frame, text="API URL:").grid(row=1, column=0, sticky="w", pady=2)
+        self.fields["BOUNCE_API_URL"] = ttk.Entry(self._api_fields_frame, width=60)
+        self.fields["BOUNCE_API_URL"].grid(row=1, column=1, sticky="ew", pady=2, padx=5)
+        self._api_fields_frame.grid_columnconfigure(1, weight=1)
+
+        self._imap_note = ttk.Label(self._imap_frame, text="", bootstyle="secondary",
+                                     font=("Segoe UI", 9, "italic"))
+        self._imap_note.grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
+
+        self._bounce_test_btn = ttk.Button(self._imap_frame, text="🔌 Testar bounce",
+                                            command=self._test_bounce, bootstyle="info")
+        self._bounce_test_btn.grid(row=4, column=0, columnspan=2, sticky="w", pady=2, padx=2)
+        self._bounce_test_status = ttk.Label(self._imap_frame, text="", font=("Segoe UI", 9))
+        self._bounce_test_status.grid(row=5, column=0, columnspan=2, sticky="w", pady=1)
+
+        # ── Buttons ──
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", pady=8)
+        ttk.Button(btn_row, text="★ Definir como padrão", command=self._set_default, bootstyle="warning").pack(side="left", padx=3)
         ttk.Button(btn_row, text="💾 Salvar configurações", command=self._save, bootstyle="success").pack(side="left", padx=3)
         ttk.Button(btn_row, text="🔌 Testar conexão", command=self._test, bootstyle="info").pack(side="left", padx=3)
         ttk.Button(btn_row, text="📂 Selecionar template", command=self._pick_template, bootstyle="primary").pack(side="left", padx=3)
@@ -1193,8 +1443,152 @@ class SMTPTab(ttk.Frame):
 
         self._load()
 
+    def _adjust_ui(self, pkey):
+        p = PROVIDER_PRESETS[pkey]
+
+        # Update field labels per provider
+        overrides = p.get("labels", {})
+        for key, lbl_w in self._field_labels.items():
+            lbl_w.configure(text=overrides.get(key, {
+                "SMTP_HOST": "Servidor:",
+                "SMTP_PORT": "Porta:",
+                "SMTP_USE_SSL": "Usar SSL:",
+                "SMTP_USERNAME": "Usuário:",
+                "SMTP_PASSWORD": "Senha:",
+                "IAM_USERNAME": "Usuário IAM:",
+            }.get(key, "")))
+
+        # Show/hide IAM_USERNAME (SES-only field)
+        iam_field = self.fields.get("IAM_USERNAME")
+        iam_label = self._field_labels.get("IAM_USERNAME")
+        if iam_field and iam_label:
+            if pkey == "amazon_ses":
+                iam_field.grid()
+                iam_label.grid()
+            else:
+                iam_field.grid_remove()
+                iam_label.grid_remove()
+
+        # Update SMTP_HOST combobox options if provider has them
+        host_field = self.fields.get("SMTP_HOST")
+        if host_field and isinstance(host_field, ttk.Combobox):
+            opts = p.get("host_options", [])
+            if opts:
+                host_field.configure(values=opts, state="normal")
+            else:
+                host_field.configure(values=[], state="normal")
+
+        # For SendGrid: fix username to "apikey" and make readonly
+        username_field = self.fields.get("SMTP_USERNAME")
+        if username_field:
+            fixed = p.get("username_fixed")
+            if fixed:
+                username_field.configure(state="normal")
+                username_field.delete(0, "end")
+                username_field.insert(0, fixed)
+                username_field.configure(state="readonly")
+            else:
+                username_field.configure(state="normal")
+
+        # Set bounce method and update visibility
+        method_field = self.fields.get("BOUNCE_METHOD")
+        if method_field:
+            method_field.set(p.get("bounce_method", "imap"))
+        self._imap_note.configure(text=p.get("bounce_note", ""), bootstyle="info")
+        self._update_bounce_visibility()
+
+        # Update credential hint
+        self._creds_label.configure(text=f"💡 {p['creds_note']}", bootstyle="info")
+
+    def _update_bounce_visibility(self):
+        method = self.fields["BOUNCE_METHOD"].get()
+        if method == "imap":
+            self._imap_fields_frame.grid()
+            self._api_fields_frame.grid_remove()
+            for key in ("IMAP_HOST", "IMAP_PORT", "IMAP_USE_SSL", "IMAP_USERNAME", "IMAP_PASSWORD"):
+                if key in self.fields:
+                    self.fields[key].configure(state="normal")
+        elif method == "api":
+            self._imap_fields_frame.grid_remove()
+            self._api_fields_frame.grid()
+            for key in ("BOUNCE_API_KEY", "BOUNCE_API_URL"):
+                if key in self.fields:
+                    self.fields[key].configure(state="normal")
+        else:
+            self._imap_fields_frame.grid_remove()
+            self._api_fields_frame.grid_remove()
+
+    def _on_bounce_method_change(self, event=None):
+        self._update_bounce_visibility()
+
+    def _select_provider(self, pkey):
+        self._current_provider = pkey
+        p = PROVIDER_PRESETS[pkey]
+
+        # Radio indicator + highlight
+        for k, (btn, boot) in self._provider_btns.items():
+            pk = PROVIDER_PRESETS[k]
+            radio = "●" if k == pkey else "○"
+            btn.configure(text=f"{radio}  {pk['emoji']}  {pk['label']}",
+                          bootstyle=f"{boot}" if k == pkey else f"{boot}-outline")
+
+        self._adjust_ui(pkey)
+        full_env = load_env()
+        pkey_upper = pkey.upper()
+
+        # SMTP fields: load prefixed or fall back to preset defaults
+        for key, default_val in p["smtp"].items():
+            if key in self.fields:
+                f = self.fields[key]
+                prefixed = full_env.get(f"{key}_{pkey_upper}")
+                if prefixed:
+                    val = prefixed
+                elif pkey == "generic":
+                    continue  # keep whatever _load set from flat keys
+                else:
+                    val = default_val
+                if isinstance(f, ttk.Combobox):
+                    f.set(val)
+                else:
+                    f.delete(0, "end")
+                    f.insert(0, val)
+
+        # IMAP fields: load prefixed or fall back to preset defaults
+        if p["imap"]:
+            for key, default_val in p["imap"].items():
+                if key in self.fields:
+                    f = self.fields[key]
+                    prefixed = full_env.get(f"{key}_{pkey_upper}")
+                    if prefixed:
+                        val = prefixed
+                    elif pkey == "generic":
+                        continue
+                    else:
+                        val = default_val
+                    if isinstance(f, ttk.Combobox):
+                        f.set(val)
+                    else:
+                        f.delete(0, "end")
+                        f.insert(0, val)
+
+        # Other fields (sender, bounce): load prefixed if saved, else keep current
+        smtp_keys = set(p["smtp"].keys())
+        imap_keys = set(p["imap"].keys()) if p["imap"] else set()
+        for key in self.fields:
+            if key in smtp_keys or key in imap_keys:
+                continue
+            prefixed = full_env.get(f"{key}_{pkey_upper}")
+            if prefixed:
+                f = self.fields[key]
+                if isinstance(f, ttk.Combobox):
+                    f.set(prefixed)
+                else:
+                    f.delete(0, "end")
+                    f.insert(0, prefixed)
+
     def _load(self):
         env = load_env()
+        # Load flat keys into fields (active/default provider's config)
         for k, v in env.items():
             if k in self.fields:
                 if isinstance(self.fields[k], ttk.Combobox):
@@ -1202,20 +1596,52 @@ class SMTPTab(ttk.Frame):
                 else:
                     self.fields[k].delete(0, "end")
                     self.fields[k].insert(0, v)
+        saved_provider = env.get("PROVIDER", "")
+        if saved_provider in PROVIDER_PRESETS:
+            self._select_provider(saved_provider)
+            return
+        # Auto-detect provider from SMTP_HOST
+        host = self.fields.get("SMTP_HOST")
+        if host:
+            host_val = host.get()
+            for pkey, preset in PROVIDER_PRESETS.items():
+                if preset["smtp"].get("SMTP_HOST", "").lower() == host_val.lower():
+                    self._select_provider(pkey)
+                    return
+        # Fallback: select generic
+        self._select_provider("generic")
 
     def _save(self):
+        provider = self._current_provider
+        if not provider:
+            self.status.configure(text="❌ Selecione um provedor primeiro.", foreground="#dc3545")
+            return
+        p = PROVIDER_PRESETS.get(provider, {})
+        label = p.get("label", provider)
         env = {}
         for k, field in self.fields.items():
-            if isinstance(field, ttk.Combobox):
-                env[k] = field.get()
-            else:
-                env[k] = field.get()
+            env[f"{k}_{provider.upper()}"] = field.get() if isinstance(field, ttk.Combobox) else field.get()
         try:
-
             save_env(env)
-            self.status.configure(text="✅ Configurações salvas em .env", foreground="#198754")
+            self.status.configure(text=f"✅ {label} salvo individualmente.", foreground="#198754")
         except Exception as e:
             self.status.configure(text=f"❌ Erro ao salvar: {e}", foreground="#dc3545")
+
+    def _set_default(self):
+        provider = self._current_provider or "generic"
+        p = PROVIDER_PRESETS.get(provider, {})
+        label = p.get("label", provider)
+        env = {}
+        for k, field in self.fields.items():
+            val = field.get() if isinstance(field, ttk.Combobox) else field.get()
+            env[k] = val
+            env[f"{k}_{provider.upper()}"] = val
+        env["PROVIDER"] = provider
+        try:
+            save_env(env)
+            self.status.configure(text=f"★ {label} definido como padrão!", foreground="#198754")
+        except Exception as e:
+            self.status.configure(text=f"❌ Erro: {e}", foreground="#dc3545")
 
     def _test(self):
         env = {}
@@ -1224,17 +1650,80 @@ class SMTPTab(ttk.Frame):
                 env[k] = field.get()
             else:
                 env[k] = field.get()
-        Thread(target=self._test_connection, args=(env,), daemon=True).start()
+        provider = self._current_provider or "personalizado"
+        provider_label = PROVIDER_PRESETS.get(provider, {}).get("label", provider)
+        self.status.configure(text=f"🔌 Testando {provider_label}...", foreground="#0d6efd")
+        Thread(target=self._test_connection, args=(env, provider_label), daemon=True).start()
 
-    def _test_connection(self, env):
+    def _test_connection(self, env, provider_label="SMTP"):
         try:
             server = _connect_smtp(env)
             server.quit()
             self.after(0, lambda: self.status.configure(
-                text="✅ Conexão SMTP bem-sucedida!", foreground="#198754"))
+                text=f"✅ {provider_label}: conexão SMTP bem-sucedida!", foreground="#198754"))
         except Exception as e:
             self.after(0, lambda: self.status.configure(
-                text=f"❌ Falha: {e}", foreground="#dc3545"))
+                text=f"❌ {provider_label}: {e}", foreground="#dc3545"))
+
+    def _test_bounce(self):
+        env = {}
+        for k, field in self.fields.items():
+            env[k] = field.get() if isinstance(field, ttk.Combobox) else field.get()
+        method = env.get("BOUNCE_METHOD", "imap")
+        self._bounce_test_status.configure(text="🔌 Testando...", foreground="#0d6efd")
+        Thread(target=self._run_bounce_test, args=(env, method), daemon=True).start()
+
+    def _run_bounce_test(self, env, method):
+        if method == "imap":
+            user = env.get("IMAP_USERNAME") or env.get("SMTP_USERNAME", "")
+            pwd = env.get("IMAP_PASSWORD") or env.get("SMTP_PASSWORD", "")
+            host = env.get("IMAP_HOST", "")
+            port = int(env.get("IMAP_PORT", "993"))
+            ssl = env.get("IMAP_USE_SSL", "true").lower() == "true"
+            if not host or not user or not pwd:
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text="❌ Preencha IMAP_HOST, usuário e senha.", foreground="#dc3545"))
+                return
+            try:
+                if ssl:
+                    mail = imaplib.IMAP4_SSL(host, port, timeout=15)
+                else:
+                    mail = imaplib.IMAP4(host, port, timeout=15)
+                    mail.starttls(ssl_context=_ssl_ctx())
+                mail.login(user, pwd)
+                mail.logout()
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text="✅ Conexão IMAP OK!", foreground="#198754"))
+            except Exception as e:
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text=f"❌ IMAP: {e}", foreground="#dc3545"))
+        elif method == "api":
+            key = env.get("BOUNCE_API_KEY", "")
+            url = env.get("BOUNCE_API_URL", "")
+            if not key:
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text="❌ Informe a API Key.", foreground="#dc3545"))
+                return
+            try:
+                import urllib.request
+                headers = {"Authorization": f"Bearer {key}"}
+                if url:
+                    req = urllib.request.Request(url, headers=headers, method="HEAD")
+                else:
+                    req = urllib.request.Request("https://api.sendgrid.com/v3/mail/send",
+                                                 headers=headers, method="HEAD")
+                urllib.request.urlopen(req, timeout=10)
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text="✅ API respondeu!", foreground="#198754"))
+            except urllib.error.HTTPError as e:
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text=f"⚠️  API: {e.code} {e.reason}", foreground="#ffc107"))
+            except Exception as e:
+                self.after(0, lambda: self._bounce_test_status.configure(
+                    text=f"❌ API: {e}", foreground="#dc3545"))
+        else:
+            self.after(0, lambda: self._bounce_test_status.configure(
+                text="ℹ️ Bounce desativado.", foreground="#6c757d"))
 
     def _pick_template(self):
         path = filedialog.askopenfilename(
@@ -1305,13 +1794,13 @@ class BounceTab(ttk.Frame):
 
     def _run_process(self):
         env = load_env()
-        user = env.get("SMTP_USERNAME", "")
-        pwd = env.get("SMTP_PASSWORD", "")
+        user = env.get("IMAP_USERNAME") or env.get("SMTP_USERNAME", "")
+        pwd = env.get("IMAP_PASSWORD") or env.get("SMTP_PASSWORD", "")
         imap_host = env.get("IMAP_HOST", "imap.gmail.com")
         imap_port = int(env.get("IMAP_PORT", "993"))
         imap_ssl = env.get("IMAP_USE_SSL", "true").lower() == "true"
         if not user or not pwd:
-            self.after(0, self._log, "[ERRO] Configure SMTP primeiro.\n")
+            self.after(0, self._log, "[ERRO] Configure IMAP ou SMTP primeiro.\n")
             return
         try:
             if imap_ssl:
