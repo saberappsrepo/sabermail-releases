@@ -20,6 +20,41 @@ def _ssl_ctx():
     ctx.verify_flags = ssl.VERIFY_X509_PARTIAL_CHAIN
     return ctx
 
+def reconectar_smtp(max_tentativas=6):
+    """Tenta reconectar ao servidor SMTP até max_tentativas vezes.
+    Retorna o novo servidor ou lança ConnectionError se todas falharem."""
+    ultimo_erro = None
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            print(f"🔄 Tentativa {tentativa}/{max_tentativas} de reconexão SMTP...")
+            time.sleep(5)
+            if SMTP_PORT == 465:
+                sv = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30, context=_ssl_ctx())
+            else:
+                sv = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+                sv.starttls(context=_ssl_ctx())
+            sv.login(SMTP_USER, SMTP_PASS)
+            print("✅ Reconectado com sucesso!")
+            return sv
+        except Exception as e:
+            ultimo_erro = e
+            print(f"   ❌ Tentativa {tentativa} falhou: {e}")
+    raise ConnectionError(
+        f"Não foi possível reconectar ao servidor SMTP após {max_tentativas} tentativas. "
+        f"Último erro: {ultimo_erro}"
+    )
+
+def _eh_erro_conexao(erro):
+    """Verifica se o erro está relacionado a perda de conexão SMTP."""
+    if isinstance(erro, smtplib.SMTPServerDisconnected):
+        return True
+    texto = str(erro).lower()
+    palavras = ["conexão com servidor perdida", "conexão perdida", "connection lost",
+                "connection refused", "timed out", "timeout", "connection reset",
+                "broken pipe", "server disconnected", "disconnect",
+                "the server is not responding", "socket"]
+    return any(p in texto for p in palavras)
+
 # ============================================================
 # CARREGA CONFIGURAÇÕES DO .ENV
 # ============================================================
@@ -610,19 +645,54 @@ def main():
             print(f"   📧 {email}")
             print(f"   📍 {cidade}")
             
-            sucesso, erro = enviar_email(server, email, contato, html_template)
-            
-            if sucesso:
+            # Tenta enviar com reconexão automática em caso de falha de conexão
+            enviado = False
+            erro_final = None
+            max_tentativas_envio = 3  # 1 tentativa inicial + até 2 reconexões
+
+            for tentativa_envio in range(max_tentativas_envio):
+                sucesso, erro = enviar_email(server, email, contato, html_template)
+
+                if sucesso:
+                    enviado = True
+                    break
+
+                erro_final = erro
+
+                if _eh_erro_conexao(erro):
+                    if tentativa_envio < max_tentativas_envio - 1:
+                        print(f"   ⚠️ Conexão perdida. Tentando reconectar...")
+                        try:
+                            server.close()
+                        except Exception:
+                            pass
+                        try:
+                            server = reconectar_smtp()
+                            print(f"   🔁 Reenviando email...")
+                            continue
+                        except ConnectionError as e:
+                            erro_final = str(e)
+                            print(f"   ❌ {erro_final}")
+                            break
+                else:
+                    break
+
+            if enviado:
                 print(f"   ✅ Enviado com sucesso!")
                 enviados += 1
                 registrar_envio(log_path, email, empresa, "sucesso")
             else:
-                print(f"   ❌ Falha: {erro}")
-                falhas.append({"email": email, "empresa": empresa, "erro": erro})
-                registrar_envio(log_path, email, empresa, "falha", erro)
+                print(f"   ❌ Falha: {erro_final}")
+                falhas.append({"email": email, "empresa": empresa, "erro": erro_final})
+                registrar_envio(log_path, email, empresa, "falha", erro_final)
+                # Se for erro de conexão irrecuperável, para a campanha
+                if _eh_erro_conexao(erro_final):
+                    salvar_checkpoint(i + 1, total, enviados, falhas, log_path, "interrompida")
+                    print(f"\n❌ Campanha interrompida devido a falha de conexão SMTP.")
+                    break
             
             # Delay aleatório entre 2-5 segundos
-            if i < total - 1:  # Não espera após o último
+            if i < total - 1 and not _eh_erro_conexao(erro_final):  # Não espera após o último
                 delay = random.uniform(DELAY_MIN_SEGUNDOS, DELAY_MAX_SEGUNDOS)
                 print(f"   ⏳ Aguardando {delay:.1f} segundos...")
                 time.sleep(delay)

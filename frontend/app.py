@@ -432,6 +432,32 @@ class CampaignTab(ttk.Frame):
         self._envios_log = []
         self._build()
 
+    def _eh_erro_conexao(self, e):
+        texto = str(e).lower()
+        palavras = ["server disconnected", "connection lost", "conexão perdida",
+                    "connection refused", "timed out", "timeout", "connection reset",
+                    "broken pipe", "the server is not responding", "socket",
+                    "nome de servidor desconhecido", "name or service not known",
+                    "no route to host", "network is unreachable"]
+        return isinstance(e, smtplib.SMTPServerDisconnected) or any(p in texto for p in palavras)
+
+    def _reconnect_smtp(self, env, max_tentativas=6):
+        ultimo_erro = None
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                self.after(0, self._log, f"🔄 Tentativa {tentativa}/{max_tentativas} de reconexão SMTP...\n")
+                time.sleep(5)
+                sv = _connect_smtp(env, timeout=30)
+                self.after(0, self._log, "✅ Reconectado ao SMTP.\n")
+                return sv
+            except Exception as ex:
+                ultimo_erro = ex
+                self.after(0, self._log, f"   ❌ Tentativa {tentativa} falhou: {ex}\n")
+        raise ConnectionError(
+            f"Não foi possível reconectar ao SMTP após {max_tentativas} tentativas. "
+            f"Último erro: {ultimo_erro}"
+        )
+
     def _build(self):
         # ── Configuração (CSV + Template) ──
         cfg = ttk.LabelFrame(self, text="Configuração")
@@ -770,33 +796,65 @@ class CampaignTab(ttk.Frame):
                 self.after(0, self._set_progress, i + 1)
                 continue
 
-            try:
-                html = html_base
-                for k, v in c["raw"].items():
-                    html = html.replace("{{" + k.upper() + "}}", str(v) if v else "")
-                    html = html.replace("{{" + k + "}}", str(v) if v else "")
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = subject
-                from_email = env.get("FROM_EMAIL") or env["SMTP_USERNAME"]
-                msg["From"] = f"{_ascii_name(from_name)} <{from_email}>"
-                msg["To"] = email
-                if reply_to:
-                    msg["Reply-To"] = reply_to
-                msg.attach(MIMEText(html, "html", "utf-8"))
-                self._server.sendmail(from_email, email, msg.as_string())
+            # Tenta enviar com reconexão automática em caso de falha de conexão
+            enviado = False
+            erro_final = None
+            max_tentativas_envio = 3
+
+            for tentativa_envio in range(max_tentativas_envio):
+                try:
+                    html = html_base
+                    for k, v in c["raw"].items():
+                        html = html.replace("{{" + k.upper() + "}}", str(v) if v else "")
+                        html = html.replace("{{" + k + "}}", str(v) if v else "")
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = subject
+                    from_email = env.get("FROM_EMAIL") or env["SMTP_USERNAME"]
+                    msg["From"] = f"{_ascii_name(from_name)} <{from_email}>"
+                    msg["To"] = email
+                    if reply_to:
+                        msg["Reply-To"] = reply_to
+                    msg.attach(MIMEText(html, "html", "utf-8"))
+                    self._server.sendmail(from_email, email, msg.as_string())
+                    enviado = True
+                    break
+                except Exception as e:
+                    erro_final = e
+                    if self._eh_erro_conexao(e) and tentativa_envio < max_tentativas_envio - 1:
+                        self.after(0, self._log, "   ⚠️ Conexão perdida. Tentando reconectar...\n")
+                        try:
+                            self._server.quit()
+                        except Exception:
+                            pass
+                        self._server = None
+                        try:
+                            self._server = self._reconnect_smtp(env)
+                            self.after(0, self._log, "   🔁 Reenviando email...\n")
+                            continue
+                        except ConnectionError as ce:
+                            erro_final = ce
+                            self.after(0, self._log, f"   ❌ {ce}\n")
+                            break
+                    else:
+                        break
+
+            if enviado:
                 enviados += 1
                 self._envios_log.append({
                     "email": email, "status": "sucesso", "erro": None,
                     "timestamp": datetime.now().isoformat()
                 })
                 self.after(0, self._log, f"[{i+1}/{total}] ✅ {email}\n")
-            except Exception as e:
-                falhas.append({"email": email, "erro": str(e)})
+            else:
+                falhas.append({"email": email, "erro": str(erro_final)})
                 self._envios_log.append({
-                    "email": email, "status": "falha", "erro": str(e),
+                    "email": email, "status": "falha", "erro": str(erro_final),
                     "timestamp": datetime.now().isoformat()
                 })
-                self.after(0, self._log, f"[{i+1}/{total}] ❌ {email} — {e}\n")
+                self.after(0, self._log, f"[{i+1}/{total}] ❌ {email} — {erro_final}\n")
+                if self._eh_erro_conexao(erro_final):
+                    self.after(0, self._log, "❌ Campanha interrompida devido a falha de conexão SMTP.\n")
+                    break
 
             self.after(0, self._set_progress, i + 1)
             if i < total - 1:
