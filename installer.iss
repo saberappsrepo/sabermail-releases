@@ -2,7 +2,7 @@
 ; Gera um instalador Windows com todas as dependências e estrutura de pastas.
 
 #define MyAppName "SaberMail"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "Saber Apps - Desenvolvedor"
 #define MyAppURL "https://saberapps.com.br"
 #define MyAppExeName "SaberMail.exe"
